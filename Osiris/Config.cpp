@@ -1,0 +1,941 @@
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <system_error>
+#include <tuple>
+
+#ifdef _WIN32
+#include <Windows.h>
+#include <shellapi.h>
+#include <ShlObj.h>
+#elif __linux__
+#include <unistd.h>
+#endif
+
+#include "nlohmann/json.hpp"
+
+#include "imgui/imgui.h"
+
+#include "Config.h"
+#include "DiscordSDK/RPC.h"
+#include "Hacks/AntiAim.h"
+#include "Hacks/Backtrack.h"
+#include "Hacks/Glow.h"
+#include "InventoryChanger/InventoryChanger.h"
+#include "InventoryChanger/InventoryConfig.h"
+#include "Hacks/Sound.h"
+#include "Hacks/Visuals.h"
+#include "Hacks/Misc.h"
+#include <Hacks/Movement.h>
+#include <Hacks/Grief.h>
+#include <Hacks/FakeLag.h>
+#include <Hacks/Extra.h>
+#include <Hacks/GrenadeHelper.h>
+#include <Hacks/MovementRecorder.h>
+#include <Hacks/Logger.h>
+#include <Hacks/Clantag.h>
+
+#ifdef _WIN32
+int CALLBACK fontCallback(const LOGFONTW* lpelfe, const TEXTMETRICW*, DWORD, LPARAM lParam)
+{
+    const wchar_t* const fontName = reinterpret_cast<const ENUMLOGFONTEXW*>(lpelfe)->elfFullName;
+
+    if (fontName[0] == L'@')
+        return TRUE;
+
+    if (HFONT font = CreateFontW(0, 0, 0, 0,
+        FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_PITCH, fontName)) {
+
+        DWORD fontData = GDI_ERROR;
+
+        if (HDC hdc = CreateCompatibleDC(nullptr)) {
+            SelectObject(hdc, font);
+            // Do not use TTC fonts as we only support TTF fonts
+            fontData = GetFontData(hdc, 'fctt', 0, NULL, 0);
+            DeleteDC(hdc);
+        }
+        DeleteObject(font);
+
+        if (fontData == GDI_ERROR) {
+            if (char buff[1024]; WideCharToMultiByte(CP_UTF8, 0, fontName, -1, buff, sizeof(buff), nullptr, nullptr))
+                reinterpret_cast<std::vector<std::string>*>(lParam)->emplace_back(buff);
+        }
+    }
+    return TRUE;
+}
+#endif
+
+[[nodiscard]] static std::filesystem::path buildConfigsFolderPath() noexcept
+{
+    std::filesystem::path path;
+#ifdef _WIN32
+    if (PWSTR pathToDocuments; SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &pathToDocuments))) {
+        path = pathToDocuments;
+        CoTaskMemFree(pathToDocuments);
+    }
+#else
+    if (const char* homeDir = getenv("HOME"))
+        path = homeDir;
+#endif
+
+    path /= "azurre\\config";
+    return path;
+}
+
+Config::Config() noexcept : path{ buildConfigsFolderPath() }
+{
+    listConfigs();
+
+    load(u8"default.json", false, false);
+
+#ifdef _WIN32
+    LOGFONTW logfont;
+    logfont.lfCharSet = ANSI_CHARSET;
+    logfont.lfPitchAndFamily = DEFAULT_PITCH;
+    logfont.lfFaceName[0] = L'\0';
+
+    EnumFontFamiliesExW(GetDC(nullptr), &logfont, fontCallback, (LPARAM)&systemFonts, 0);
+#endif
+
+    std::sort(std::next(systemFonts.begin()), systemFonts.end());
+}
+
+static void from_json(const json& j, ColorToggleRounding& ctr)
+{
+    from_json(j, static_cast<ColorToggle&>(ctr));
+
+    read(j, "Rounding", ctr.rounding);
+}
+
+static void from_json(const json& j, Font& f)
+{
+    read<value_t::string>(j, "Name", f.name);
+
+    if (!f.name.empty())
+        config->scheduleFontLoad(f.name);
+
+    if (const auto it = std::ranges::find(config->getSystemFonts(), f.name); it != config->getSystemFonts().end())
+        f.index = std::distance(config->getSystemFonts().begin(), it);
+    else
+        f.index = 0;
+}
+
+static void from_json(const json& j, Snapline& s)
+{
+    from_json(j, static_cast<ColorToggleThickness&>(s));
+
+    read(j, "Type", s.type);
+}
+
+static void from_json(const json& j, Box& b)
+{
+    from_json(j, static_cast<ColorToggleRounding&>(b));
+
+    read(j, "Type", b.type);
+    read(j, "Scale", b.scale);
+    read<value_t::object>(j, "Fill", b.fill);
+}
+
+static void from_json(const json& j, Shared& s)
+{
+    read(j, "Enabled", s.enabled);
+    read<value_t::object>(j, "Font", s.font);
+    read<value_t::object>(j, "Snapline", s.snapline);
+    read<value_t::object>(j, "Box", s.box);
+    read<value_t::object>(j, "Name", s.name);
+    read(j, "Text Cull Distance", s.textCullDistance);
+}
+
+static void from_json(const json& j, Weapon& w)
+{
+    from_json(j, static_cast<Shared&>(w));
+
+    read<value_t::object>(j, "Ammo", w.ammo);
+}
+
+static void from_json(const json& j, Trail& t)
+{
+    from_json(j, static_cast<ColorToggleThickness&>(t));
+
+    read(j, "Type", t.type);
+    read(j, "Time", t.time);
+}
+
+static void from_json(const json& j, Trails& t)
+{
+    read(j, "Enabled", t.enabled);
+    read<value_t::object>(j, "Local Player", t.localPlayer);
+    read<value_t::object>(j, "Allies", t.allies);
+    read<value_t::object>(j, "Enemies", t.enemies);
+}
+
+static void from_json(const json& j, Projectile& p)
+{
+    from_json(j, static_cast<Shared&>(p));
+
+    read<value_t::object>(j, "Trails", p.trails);
+}
+
+static void from_json(const json& j, Player& p)
+{
+    from_json(j, static_cast<Shared&>(p));
+
+    read<value_t::object>(j, "Weapon", p.weapon);
+    read<value_t::object>(j, "Flash Duration", p.flashDuration);
+    read(j, "Audible Only", p.audibleOnly);
+    read(j, "Spotted Only", p.spottedOnly);
+    read(j, "Rank", p.rank);
+    read(j, "Flags", p.flags);
+    read<value_t::object>(j, "Armor Bar", p.armorBar);
+    read<value_t::object>(j, "Health Bar", p.healthBar);
+    read<value_t::object>(j, "Skeleton", p.skeleton);
+    read<value_t::object>(j, "Head Box", p.headBox);
+    read<value_t::object>(j, "Line of sight", p.lineOfSight);
+}
+
+static void from_json(const json& j, Config::LegitAimbot& a)
+{
+    read(j, "Enabled", a.enabled);
+    read(j, "Aimlock", a.aimlock);
+    read(j, "Friendly fire", a.friendlyFire);
+    read(j, "Visible only", a.visibleOnly);
+    read(j, "Scoped only", a.scopedOnly);
+    read(j, "Ignore flash", a.ignoreFlash);
+    read(j, "Ignore smoke", a.ignoreSmoke);
+    read(j, "Auto shot", a.autoShot);
+    read(j, "Fov", a.fov);
+    read(j, "Deadzone", a.deadzone);
+    read(j, "Reaction Time", a.reactionTime);
+    read(j, "Smooth", a.smooth);
+    read(j, "Hitboxes", a.hitboxes);
+    read(j, "Min Damage", a.minDamage);
+    read(j, "Recoil control X", a.recoilControlX);
+    read(j, "Recoil control Y", a.recoilControlY);
+    read(j, "Shots fired", a.shotsFired);
+    read(j, "Killshot", a.killshot);
+    read(j, "Between shots", a.betweenShots);
+    read(j, "Standalone RCS", a.standaloneRCS);
+    read(j, "Standalone RCS Ignore Shots", a.shotsFired);
+    read(j, "Standalone RCS Random factor", a.randomRCS);
+}
+
+static void from_json(const json& j, Config::RageAimbot& a)
+{
+    read(j, "Enabled Weapon", a.renabled);
+    read(j, "Aimlock", a.raimlock);
+    read(j, "Silent", a.rsilent);
+    read(j, "Friendly fire", a.rfriendlyFire);
+    read(j, "Visible only", a.rvisibleOnly);
+    read(j, "Auto Shot", a.rautoShot);
+    read(j, "Auto Scope", a.rautoScope);
+    read(j, "Scoped Only", a.rscopedOnly);
+    read(j, "Fov", a.rfov);
+    read(j, "Hitbox", a.rhitbox);
+    read(j, "Multipoints", a.rmultiPoint);
+    read(j, "Hitchance", a.rhitchance);
+    read(j, "Min Damage", a.rminDamage);
+    read(j, "Override Min Damage", a.roverridedMinDamage);
+    read(j, "Between shots", a.rbetweenShots);
+    read(j, "Force accuracy", a.rforceAccuracy);
+    read(j, "Auto duck", a.rautoDuck);
+    read(j, "Priority", a.rpriority);
+
+}
+
+static void from_json(const json& j, Config::Triggerbot& t)
+{
+    read(j, "Enabled", t.enabled);
+    read(j, "Friendly fire", t.friendlyFire);
+    read(j, "Scoped only", t.scopedOnly);
+    read(j, "Ignore flash", t.ignoreFlash);
+    read(j, "Ignore smoke", t.ignoreSmoke);
+    read(j, "Hitgroup", t.hitgroup);
+    read(j, "Shot delay", t.shotDelay);
+    read(j, "Min damage", t.minDamage);
+    read(j, "Killshot", t.killshot);
+    read(j, "Burst Time", t.burstTime);
+}
+
+static void from_json(const json& j, Config::Chams::Material& m)
+{
+    from_json(j, static_cast<Color4&>(m));
+
+    read(j, "Enabled", m.enabled);
+    read(j, "Health based", m.healthBased);
+    read(j, "Blinking", m.blinking);
+    read(j, "Wireframe", m.wireframe);
+    read(j, "Cover", m.cover);
+    read(j, "Ignore-Z", m.ignorez);
+    read(j, "Material", m.material);
+}
+
+static void from_json(const json& j, Config::Chams& c)
+{
+    read_array_opt(j, "Materials", c.materials);
+}
+
+static void from_json(const json& j, Config::StreamProofESP& e)
+{
+    read(j, "Toggle Key", e.toggleKey);
+    read(j, "Hold Key", e.holdKey);
+    read(j, "Allies", e.allies);
+    read(j, "Enemies", e.enemies);
+    read(j, "Weapons", e.weapons);
+    read(j, "Projectiles", e.projectiles);
+    read(j, "Loot Crates", e.lootCrates);
+    read(j, "Other Entities", e.otherEntities);
+}
+
+static void from_json(const json& j, Config::ProfileChanger& p) {
+    read(j, "Enabled", p.enabled);
+    read(j, "Enabled Ranks", p.enabledRanks);
+    read(j, "Enabled Commends", p.enabledCommends);
+    read(j, "Enabled Bans", p.enabledBans);
+    read(j, "Enabled Stats", p.enabledStats);
+    read(j, "Commend Friendly", p.friendly);
+    read(j, "Commend Teacher", p.teach);
+    read(j, "Commend Leader", p.leader);
+    read(j, "Competitive Rank", p.rank);
+    read(j, "Competitive Wins", p.wins);
+    read(j, "Wingman Rank", p.wmrank);
+    read(j, "Wingman Wins", p.wmwins);
+    read(j, "Danger Zone Rank", p.dzrank);
+    read(j, "Danger Zone Wins", p.dzwins);
+    read(j, "Account Status", p.accountStatus);
+    read(j, "Team Color", p.colorTeam);
+    read(j, "Level", p.level);
+    read(j, "XP", p.exp);
+    read(j, "Ban Type", p.banType);
+    read(j, "Ban Time", p.banTime);
+    read(j, "Kills", p.kills);
+    read(j, "Assists", p.assists);
+    read(j, "Deaths", p.deaths);
+    read(j, "MVP", p.mvp);
+    read(j, "Score", p.score);
+    read(j, "Communication Abuse Mute", p.hasCommunicationAbuseMute);
+}
+
+static void from_json(const json& j, Config::Style& s)
+{
+    read(j, "Menu style", s.menuStyle);
+    read(j, "Menu colors", s.menuColors);
+    read(j, "Window Border", s.windowBorder);
+    read(j, "Frame Border", s.frameBorder);
+    read(j, "Rounded corners", s.roundedCorners);
+    read(j, "AntiAliasing", s.antiAliasing);
+    read(j, "Center Titles", s.centerTitle);
+    read(j, "Global Scale", s.scale);
+    read(j, "Block Input", s.blockInput);
+    read(j, "Message Color Prefix", s.prefixColor);
+    read(j, "ESC", s.escCloseMenu);
+    read(j, "Banner", s.banner);
+
+    if (j.contains("Colors") && j["Colors"].is_object()) {
+        const auto& colors = j["Colors"];
+
+        ImGuiStyle& style = ImGui::GetStyle();
+
+        for (int i = 0; i < ImGuiCol_COUNT; i++) {
+            if (const char* name = ImGui::GetStyleColorName(i); colors.contains(name)) {
+                std::array<float, 4> temp;
+                read(colors, name, temp);
+                style.Colors[i].x = temp[0];
+                style.Colors[i].y = temp[1];
+                style.Colors[i].z = temp[2];
+                style.Colors[i].w = temp[3];
+            }
+        }
+    }
+}
+
+static void from_json(const json& j, Config::Style::BackgroundEffect& t)
+{
+    read<value_t::object>(j, "Color", t.lineCol);
+    read(j, "Amount", t.N);
+    read(j, "Max Distance", t.lineMaxDist);
+    read(j, "Thickness", t.lineThickness);
+    read(j, "Darkness", t.darkness);
+}
+
+static void from_json(const json& j, Config::ZeusBot& z)
+{
+    read(j, "Enabled", z.enable);
+    read(j, "Silent", z.silent);
+    read(j, "Max Distance", z.autoZeusMaxPenDist);
+    read(j, "Hitchance", z.hitchance);
+}
+
+
+bool Config::load(size_t id, bool incremental, bool clip) noexcept
+{
+    return load(configs[id].c_str(), incremental, clip);
+}
+
+bool Config::load(const char8_t* name, bool incremental, bool clip) noexcept
+{
+    json j;
+
+    if (clip) {
+        std::string in = ImGui::GetClipboardText();
+        j = json::parse(in, nullptr, false, true);
+        if (j.is_discarded())
+            return false;
+
+    } else {
+        if (std::ifstream in{ path / name }; in.good()) {
+            j = json::parse(in, nullptr, false, true);
+            if (j.is_discarded())
+                return false;
+        }
+        else {
+            return false;
+        }
+    }
+
+    if (!incremental)
+        reset();
+
+    read(j, "LegitAimbot", legitaimbot);
+    read<value_t::object>(j, "Legitbot Deadzone Fov", legitbotDeadzone);
+    read<value_t::object>(j, "Legitbot Fov", legitbotFov);
+    read(j, "Enable Ragebot", globalEnabledRagebot);
+    read(j, "RageAimbot", rageaimbot);
+    read(j, "Min Damage Override Key", minDamageOverride);
+    read(j, "Aimbot Key", aimbotKey);
+    read(j, "Aimbot Key mode", aimbotKeyMode);
+    read(j, "Triggerbot", triggerbot);
+    read(j, "Triggerbot Key", triggerbotHoldKey);
+    read(j, "Resolver", resolver);
+
+    read(j, "Chams", chams);
+    read(j["Chams"], "Toggle Key", chamsToggleKey);
+    read(j["Chams"], "Hold Key", chamsHoldKey);
+    read<value_t::object>(j, "ESP", streamProofESP);
+    read<value_t::object>(j, "Style", style);
+    read<value_t::object>(j, "Background", style.bgEffect);
+    read<value_t::object>(j, "ZeusBot", zeusbot);
+    read<value_t::object>(j, "Profile Changer", profilechanger);
+    AntiAim::fromJson(j["Anti aim"]);
+    Backtrack::fromJson(j["Backtrack"]);
+    Glow::fromJson(j["Glow"]);
+    Visuals::fromJson(j["Visuals"]);
+    Movement::fromJson(j["Movement"]);
+    MovementRecorder::fromJson(j["Movement recorder"]);
+    Fun::fromJson(j["Trolling"]);
+    fromJson(j["Inventory Changer"], inventory_changer::InventoryChanger::instance());
+    Nade::fromJson(j["Grenade Helper"]);
+    Sound::fromJson(j["Sound"]);
+    Misc::fromJson(j["Misc"]);
+    Clan::fromJson(j["Clan Tag"]);
+    Log::fromJson(j["Logs"]);
+    Extra::fromJson(j["Extra"]);
+    FakeLag::fromJson(j["Fake Lag"]);
+    Discord::fromJson(j["Discord RP"]);
+
+    return true;
+}
+
+static void to_json(json& j, const ColorToggleRounding& o, const ColorToggleRounding& dummy = {})
+{
+    to_json(j, static_cast<const ColorToggle&>(o), dummy);
+    WRITE("Rounding", rounding);
+}
+
+static void to_json(json& j, const ColorToggleThicknessRounding& o, const ColorToggleThicknessRounding& dummy = {})
+{
+    to_json(j, static_cast<const ColorToggleRounding&>(o), dummy);
+    WRITE("Thickness", thickness);
+}
+
+static void to_json(json& j, const Font& o, const Font& dummy = {})
+{
+    WRITE("Name", name);
+}
+
+static void to_json(json& j, const Snapline& o, const Snapline& dummy = {})
+{
+    to_json(j, static_cast<const ColorToggleThickness&>(o), dummy);
+    WRITE("Type", type);
+}
+
+static void to_json(json& j, const Box& o, const Box& dummy = {})
+{
+    to_json(j, static_cast<const ColorToggleRounding&>(o), dummy);
+    WRITE("Type", type);
+    WRITE("Scale", scale);
+    WRITE("Fill", fill);
+}
+
+static void to_json(json& j, const Shared& o, const Shared& dummy = {})
+{
+    WRITE("Enabled", enabled);
+    WRITE("Font", font);
+    WRITE("Snapline", snapline);
+    WRITE("Box", box);
+    WRITE("Name", name);
+    WRITE("Text Cull Distance", textCullDistance);
+}
+
+static void to_json(json& j, const Player& o, const Player& dummy = {})
+{
+    to_json(j, static_cast<const Shared&>(o), dummy);
+    WRITE("Weapon", weapon);
+    WRITE("Flash Duration", flashDuration);
+    WRITE("Audible Only", audibleOnly);
+    WRITE("Spotted Only", spottedOnly);
+    WRITE("Flags", flags);
+    WRITE("Armor Bar", armorBar);
+    WRITE("Health Bar", healthBar);
+    WRITE("Rank", rank);
+    WRITE("Skeleton", skeleton);
+    WRITE("Head Box", headBox);
+    WRITE("Line of sight", lineOfSight);
+}
+
+static void to_json(json& j, const Weapon& o, const Weapon& dummy = {})
+{
+    to_json(j, static_cast<const Shared&>(o), dummy);
+    WRITE("Ammo", ammo);
+}
+
+static void to_json(json& j, const Trail& o, const Trail& dummy = {})
+{
+    to_json(j, static_cast<const ColorToggleThickness&>(o), dummy);
+    WRITE("Type", type);
+    WRITE("Time", time);
+}
+
+static void to_json(json& j, const Trails& o, const Trails& dummy = {})
+{
+    WRITE("Enabled", enabled);
+    WRITE("Local Player", localPlayer);
+    WRITE("Allies", allies);
+    WRITE("Enemies", enemies);
+}
+
+static void to_json(json& j, const Projectile& o, const Projectile& dummy = {})
+{
+    j = static_cast<const Shared&>(o);
+
+    WRITE("Trails", trails);
+}
+
+static void to_json(json& j, const ImVec2& o, const ImVec2& dummy = {})
+{
+    WRITE("X", x);
+    WRITE("Y", y);
+}
+
+static void to_json(json& j, const Config::LegitAimbot& o, const Config::LegitAimbot& dummy = {})
+{
+    WRITE("Enabled", enabled);
+    WRITE("Aimlock", aimlock);
+    WRITE("Friendly fire", friendlyFire);
+    WRITE("Visible only", visibleOnly);
+    WRITE("Scoped only", scopedOnly);
+    WRITE("Ignore flash", ignoreFlash);
+    WRITE("Ignore smoke", ignoreSmoke);
+    WRITE("Auto shot", autoShot);
+    WRITE("Fov", fov);
+    WRITE("Deadzone", deadzone);
+    WRITE("Reaction Time", reactionTime);
+    WRITE("Smooth", smooth);
+    WRITE("Hitboxes", hitboxes);
+    WRITE("Min Damage", minDamage);
+    WRITE("Recoil control X", recoilControlX);
+    WRITE("Recoil control Y", recoilControlY);
+    WRITE("Killshot", killshot);
+    WRITE("Between shots", betweenShots);
+    WRITE("Standalone RCS", standaloneRCS);
+    WRITE("Standalone RCS Ignore Shots", shotsFired);
+    WRITE("Standalone RCS Random factor", randomRCS);
+}
+
+static void to_json(json& j, const Config::RageAimbot& o, const Config::RageAimbot& dummy = {})
+{
+    WRITE("Enabled Weapon", renabled);
+    WRITE("Aimlock", raimlock);
+    WRITE("Silent", rsilent);
+    WRITE("Friendly fire", rfriendlyFire);
+    WRITE("Visible only", rvisibleOnly);
+    WRITE("Auto Shot", rautoShot);
+    WRITE("Auto Scope", rautoScope);
+    WRITE("Scoped Only", rscopedOnly);
+    WRITE("Fov", rfov);
+    WRITE("Hitbox", rhitbox);
+    WRITE("Multipoints", rmultiPoint);
+    WRITE("Hitchance", rhitchance);;
+    WRITE("Min Damage", rminDamage);
+    WRITE("Override Min Damage", roverridedMinDamage);
+    WRITE("Between shots", rbetweenShots);
+    WRITE("Force accuracy", rforceAccuracy);
+    WRITE("Auto duck", rautoDuck);
+    WRITE("Priority", rpriority);
+}
+
+static void to_json(json& j, const Config::Triggerbot& o, const Config::Triggerbot& dummy = {})
+{
+    WRITE("Enabled", enabled);
+    WRITE("Friendly fire", friendlyFire);
+    WRITE("Scoped only", scopedOnly);
+    WRITE("Ignore flash", ignoreFlash);
+    WRITE("Ignore smoke", ignoreSmoke);
+    WRITE("Hitgroup", hitgroup);
+    WRITE("Shot delay", shotDelay);
+    WRITE("Min damage", minDamage);
+    WRITE("Killshot", killshot);
+    WRITE("Burst Time", burstTime);
+}
+
+static void to_json(json& j, const Config::Chams::Material& o)
+{
+    const Config::Chams::Material dummy;
+
+    to_json(j, static_cast<const Color4&>(o), dummy);
+    WRITE("Enabled", enabled);
+    WRITE("Health based", healthBased);
+    WRITE("Blinking", blinking);
+    WRITE("Wireframe", wireframe);
+    WRITE("Cover", cover);
+    WRITE("Ignore-Z", ignorez);
+    WRITE("Material", material);
+}
+
+static void to_json(json& j, const Config::Chams& o)
+{
+    j["Materials"] = o.materials;
+}
+
+static void to_json(json& j, const Config::StreamProofESP& o, const Config::StreamProofESP& dummy = {})
+{
+    WRITE("Toggle Key", toggleKey);
+    WRITE("Hold Key", holdKey);
+    j["Allies"] = o.allies;
+    j["Enemies"] = o.enemies;
+    j["Weapons"] = o.weapons;
+    j["Projectiles"] = o.projectiles;
+    j["Loot Crates"] = o.lootCrates;
+    j["Other Entities"] = o.otherEntities;
+}
+
+static void to_json(json& j, const ImVec4& o)
+{
+    j[0] = o.x;
+    j[1] = o.y;
+    j[2] = o.z;
+    j[3] = o.w;
+}
+
+static void to_json(json& j, const Config::ProfileChanger& o, const Config::ProfileChanger& dummy = {}) {
+    WRITE("Enabled", enabled);
+    WRITE("Enabled Ranks", enabledRanks);
+    WRITE("Enabled Commends", enabledCommends);
+    WRITE("Enabled Bans", enabledBans);
+    WRITE("Enabled Stats", enabledStats);
+    WRITE("Commend Friendly", friendly);
+    WRITE("Commend Teacher", teach);
+    WRITE("Commend Leader", leader);
+    WRITE("Competitive Rank", rank);
+    WRITE("Competitive Wins", wins);
+    WRITE("Wingman Rank", wmrank);
+    WRITE("Wingman Wins", wmwins);
+    WRITE("Danger Zone Rank", dzrank);
+    WRITE("Danger Zone Wins", dzwins);
+    WRITE("Level", level);
+    WRITE("Account Status", accountStatus);
+    WRITE("Team Color", colorTeam);
+    WRITE("XP", exp);
+    WRITE("Ban Type", banType);
+    WRITE("Ban Time", banTime);
+    WRITE("Kills", kills);
+    WRITE("Assists", assists);
+    WRITE("Deaths", deaths);
+    WRITE("MVP", mvp);
+    WRITE("Score", score);
+    WRITE("Communication Abuse Mute", hasCommunicationAbuseMute);
+}
+static void to_json(json& j, const Config::Style& o)
+{
+    const Config::Style dummy;
+
+    WRITE("Menu style", menuStyle);
+    WRITE("Menu colors", menuColors);
+    WRITE("Window Border", windowBorder);
+    WRITE("Frame Border", frameBorder);
+    WRITE("Rounded corners", roundedCorners);
+    WRITE("AntiAliasing", antiAliasing);
+    WRITE("Center Titles", centerTitle);
+    WRITE("Global Scale", scale);
+    WRITE("Block Input", blockInput);
+    WRITE("Message Color Prefix", prefixColor);
+    WRITE("ESC", escCloseMenu);
+    WRITE("Banner", banner);
+
+
+    auto& colors = j["Colors"];
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    for (int i = 0; i < ImGuiCol_COUNT; i++)
+        colors[ImGui::GetStyleColorName(i)] = style.Colors[i];
+}
+
+static void to_json(json& j, const Config::Style::BackgroundEffect& o)
+{
+    const Config::Style::BackgroundEffect dummy;
+
+    WRITE("Color", lineCol);
+    WRITE("Amount", N);
+    WRITE("Max Distance", lineMaxDist);
+    WRITE("Thickness", lineThickness);
+    WRITE("Darkness", darkness);
+}
+
+static void to_json(json& j, const Config::ZeusBot& o, const Config::ZeusBot& dummy = {})
+{
+    WRITE("Enabled", enable);
+    WRITE("Silent", silent);
+    WRITE("Hitchance", hitchance);
+    WRITE("Max Distance", autoZeusMaxPenDist);
+}
+
+void removeEmptyObjects(json& j) noexcept
+{
+    for (auto it = j.begin(); it != j.end();) {
+        auto& val = it.value();
+        if (val.is_object() || val.is_array())
+            removeEmptyObjects(val);
+        if (val.empty() && !j.is_array())
+            it = j.erase(it);
+        else
+            ++it;
+    }
+}
+
+void Config::save(size_t id, bool clip) const noexcept
+{
+    json j;
+
+    j["LegitAimbot"] = legitaimbot;
+    j["Legitbot Deadzone Fov"] = legitbotDeadzone;
+    j["Legitbot Fov"] = legitbotFov;
+    j["Enable Ragebot"] = globalEnabledRagebot;
+    j["RageAimbot"] = rageaimbot;
+    to_json(j["Aimbot Key"], aimbotKey, {});
+    to_json(j["Min Damage Override Key"], minDamageOverride, {});
+    j["Aimbot Key mode"] = aimbotKeyMode;
+    j["Resolver"] = resolver;
+
+    j["Triggerbot"] = triggerbot;
+    to_json(j["Triggerbot Key"], triggerbotHoldKey, {});
+
+    j["Backtrack"] = Backtrack::toJson();
+    j["Anti aim"] = AntiAim::toJson();
+    j["Glow"] = Glow::toJson();
+    j["Chams"] = chams;
+    to_json(j["Chams"]["Toggle Key"], chamsToggleKey, {});
+    to_json(j["Chams"]["Hold Key"], chamsHoldKey, {});
+    j["ESP"] = streamProofESP;
+    j["Sound"] = Sound::toJson();
+    j["Visuals"] = Visuals::toJson();
+    j["Movement"] = Movement::toJson();
+    j["Movement recorder"] = MovementRecorder::toJson();
+    j["Extra"] = Extra::toJson();
+    j["Trolling"] = Fun::toJson();
+    j["Misc"] = Misc::toJson();
+    j["Clan Tag"] = Clan::toJson();
+    j["Logs"] = Log::toJson();
+    j["Fake Lag"] = FakeLag::toJson();
+    j["Discord RP"] = Discord::toJson();
+    j["Style"] = style;
+    j["Background"] = style.bgEffect;
+    j["ZeusBot"] = zeusbot;
+    j["Profile Changer"] = profilechanger;
+    j["Inventory Changer"] = toJson(inventory_changer::InventoryChanger::instance());
+    j["Grenade Helper"] = Nade::toJson();
+
+
+    removeEmptyObjects(j);
+
+    if (clip) {
+        std::string out;
+        out = j.dump(4) + "\n";
+        ImGui::SetClipboardText(out.c_str());
+    } else {
+        createConfigDir();
+        if (std::ofstream out{ path / configs[id] }; out.good())
+            out << std::setw(2) << j;
+    }
+}
+
+void Config::add(const char8_t* name) noexcept
+{
+    if (*name && std::ranges::find(configs, name) == configs.cend()) {
+        configs.emplace_back(name);
+        save(configs.size() - 1, false);
+    }
+}
+
+void Config::remove(size_t id) noexcept
+{
+    std::error_code ec;
+    std::filesystem::remove(path / configs[id], ec);
+    configs.erase(configs.cbegin() + id);
+}
+
+void Config::rename(size_t item, std::u8string_view newName) noexcept
+{
+    std::error_code ec;
+    std::filesystem::rename(path / configs[item], path / newName, ec);
+    configs[item] = newName;
+}
+
+void Config::reset() noexcept
+{
+    legitaimbot = { };
+    rageaimbot = { };
+    triggerbot = { };
+    chams = { };
+    streamProofESP = { };
+    style = { };
+    profilechanger = { };
+
+    Movement::resetConfig();
+    Fun::resetConfig();
+    AntiAim::resetConfig();
+    Backtrack::resetConfig();
+    Glow::resetConfig();
+    Extra::resetConfig();
+    Visuals::resetConfig();
+    inventory_changer::InventoryChanger::instance().reset();
+    Sound::resetConfig();
+    Misc::resetConfig();
+    Clan::resetConfig();
+    FakeLag::resetConfig();
+    Discord::resetConfig();
+}
+
+void Config::listConfigs() noexcept
+{
+    configs.clear();
+
+    std::error_code ec;
+    std::transform(std::filesystem::directory_iterator{ path, ec },
+                   std::filesystem::directory_iterator{ },
+                   std::back_inserter(configs),
+                   [](const auto& entry) { return entry.path().filename().u8string(); });
+}
+
+void Config::createConfigDir() const noexcept
+{
+    std::error_code ec; std::filesystem::create_directory(path, ec);
+}
+
+void Config::openConfigDir() const noexcept
+{
+    createConfigDir();
+#ifdef _WIN32
+    ShellExecuteW(nullptr, L"open", path.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+    if (fork() == 0) {
+        constexpr auto xdgPath = "/usr/bin/xdg-open";
+        execl(xdgPath, xdgPath, path.string().c_str(), static_cast<char*>(nullptr));
+    }
+#endif
+}
+
+void Config::scheduleFontLoad(const std::string& name) noexcept
+{
+    scheduledFonts.push_back(name);
+}
+
+#ifdef _WIN32
+static auto getFontData(const std::string& fontName) noexcept
+{
+    HFONT font = CreateFontA(0, 0, 0, 0,
+        FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_PITCH, fontName.c_str());
+
+    std::unique_ptr<std::byte[]> data;
+    DWORD dataSize = GDI_ERROR;
+
+    if (font) {
+        HDC hdc = CreateCompatibleDC(nullptr);
+
+        if (hdc) {
+            SelectObject(hdc, font);
+            dataSize = GetFontData(hdc, 0, 0, nullptr, 0);
+
+            if (dataSize != GDI_ERROR) {
+                data = std::make_unique<std::byte[]>(dataSize);
+                dataSize = GetFontData(hdc, 0, 0, data.get(), dataSize);
+
+                if (dataSize == GDI_ERROR)
+                    data.reset();
+            }
+            DeleteDC(hdc);
+        }
+        DeleteObject(font);
+    }
+    return std::make_pair(std::move(data), dataSize);
+}
+#endif
+
+bool Config::loadScheduledFonts() noexcept
+{
+    bool result = false;
+
+    for (const auto& fontName : scheduledFonts) {
+        if (fontName == "Default") {
+            if (fonts.find("Default") == fonts.cend()) {
+                ImFontConfig cfg;
+                cfg.OversampleH = cfg.OversampleV = 1;
+                cfg.PixelSnapH = true;
+                cfg.RasterizerMultiply = 1.7f;
+
+                Font newFont;
+
+                cfg.SizePixels = 13.0f;
+                newFont.big = ImGui::GetIO().Fonts->AddFontDefault(&cfg);
+
+                cfg.SizePixels = 10.0f;
+                newFont.medium = ImGui::GetIO().Fonts->AddFontDefault(&cfg);
+
+                cfg.SizePixels = 8.0f;
+                newFont.tiny = ImGui::GetIO().Fonts->AddFontDefault(&cfg);
+
+                fonts.emplace(fontName, newFont);
+                result = true;
+            }
+            continue;
+        }
+
+#ifdef _WIN32
+        const auto [fontData, fontDataSize] = getFontData(fontName);
+        if (fontDataSize == GDI_ERROR)
+            continue;
+
+        if (fonts.find(fontName) == fonts.cend()) {
+            const auto ranges = Helpers::getFontGlyphRanges();
+            ImFontConfig cfg;
+            cfg.FontDataOwnedByAtlas = false;
+            cfg.RasterizerMultiply = 1.7f;
+
+            Font newFont;
+            newFont.tiny = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(fontData.get(), fontDataSize, 8.0f, &cfg, ranges);
+            newFont.medium = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(fontData.get(), fontDataSize, 10.0f, &cfg, ranges);
+            newFont.big = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(fontData.get(), fontDataSize, 13.0f, &cfg, ranges);
+            fonts.emplace(fontName, newFont);
+            result = true;
+        }
+#endif
+    }
+    scheduledFonts.clear();
+    return result;
+}

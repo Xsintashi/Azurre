@@ -1,0 +1,8 @@
+// Pliki wskazówek ułatwiają interpretowanie identyfikatorów programu Visual C++ w środowisku Visual Studio IDE
+// takich jak nazwy funkcji i makr.
+// Aby uzyskać więcej informacji, zobacz https://go.microsoft.com/fwlink/?linkid=865984
+#define GAME_INTERFACE(type, name, moduleName, version) type* name = reinterpret_cast<type*>(find(moduleName, version));
+#define NETVAR(funcname, class_name, var_name, type) NETVAR_OFFSET(funcname, class_name, var_name, 0, type)
+#define MB_OK
+#define _WIN32
+#define NETVAR2(funcname, class_name, var_name, __VA_ARGS__) NETVAR_OFFSET2(funcname, class_name, var_name, 0, __VA_ARGS__)
